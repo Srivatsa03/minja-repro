@@ -48,15 +48,40 @@ class BackendError(RuntimeError):
     pass
 
 
-def _post(url: str, payload: dict, headers: dict, *, timeout: float, retries: int) -> dict:
-    """POST JSON with bounded retries on transient failures.
+def _retry_after_seconds(exc: urllib.error.HTTPError, body: str) -> float | None:
+    """How long the server asked us to wait, from the header or the message body.
 
-    Retries only on 429 and 5xx. A 400 means the request is wrong and repeating
-    it just burns tokens, so it is raised immediately.
+    A token-per-minute limit recovers on its own in well under a second, and the
+    provider says exactly when: a Retry-After header, or a "try again in 165ms"
+    phrase in the body. Honoring that beats a blind exponential backoff, which
+    would sleep seconds for a sub-second limit.
+    """
+    header = exc.headers.get("retry-after") if exc.headers else None
+    if header:
+        try:
+            return float(header)
+        except ValueError:
+            pass
+    match = re.search(r"try again in ([\d.]+)\s*(ms|s)", body)
+    if match:
+        value = float(match.group(1))
+        return value / 1000.0 if match.group(2) == "ms" else value
+    return None
+
+
+def _post(url: str, payload: dict, headers: dict, *, timeout: float, retries: int) -> dict:
+    """POST JSON, retrying transient failures and honoring the server's retry hint.
+
+    A 400 means the request is wrong and repeating it just burns tokens, so it is
+    raised immediately. A 429 is a rate limit that recovers, so it does not count
+    against the retry budget: a long run on a tight free-tier quota is paced by
+    the server rather than failed by it.
     """
     body = json.dumps(payload).encode()
     last: Exception | None = None
-    for attempt in range(retries + 1):
+    attempt = 0
+    rate_limit_waits = 0
+    while True:
         request = urllib.request.Request(
             url,
             data=body,
@@ -67,13 +92,22 @@ def _post(url: str, payload: dict, headers: dict, *, timeout: float, retries: in
                 return json.loads(response.read())
         except urllib.error.HTTPError as exc:
             detail = exc.read()[:400].decode(errors="replace")
-            if exc.code not in (429, 500, 502, 503, 504) or attempt == retries:
+            if exc.code == 429:
+                # Rate limits recover; pace against them rather than spend a retry.
+                # Cap the number of waits so a genuinely exhausted quota still ends.
+                if rate_limit_waits >= 120:
+                    raise BackendError(f"HTTP 429 after {rate_limit_waits} waits: {detail}") from exc
+                rate_limit_waits += 1
+                time.sleep((_retry_after_seconds(exc, detail) or 1.0) + 0.1)
+                continue
+            if exc.code not in (500, 502, 503, 504) or attempt >= retries:
                 raise BackendError(f"HTTP {exc.code}: {detail}") from exc
             last = exc
         except (urllib.error.URLError, TimeoutError) as exc:
-            if attempt == retries:
+            if attempt >= retries:
                 raise BackendError(f"transport failure: {exc}") from exc
             last = exc
+        attempt += 1
         time.sleep(min(2 ** attempt, 8))
     raise BackendError(f"exhausted retries: {last}")
 

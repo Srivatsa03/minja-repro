@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import __version__
 from .backends import OPENAI_COMPATIBLE, BackendError, list_models, resolve
-from .dataset import SYNTHETIC, load_mmlu_csv, spec_for, victim_queries
+from .dataset import SYNTHETIC, load_mmlu_csv, load_mmlu_hf, spec_for, victim_queries
 from .guard import format_guard_test, run_guard_test
 from .evaluate import (
     Experiment,
@@ -55,11 +55,12 @@ def cmd_reanalyze(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    questions = (
-        load_mmlu_csv(Path(args.mmlu), limit=args.limit)
-        if args.mmlu
-        else list(SYNTHETIC)[: args.limit]
-    )
+    if args.mmlu:
+        questions = load_mmlu_csv(Path(args.mmlu), limit=args.limit)
+    elif args.mmlu_subject:
+        questions = load_mmlu_hf(args.mmlu_subject, limit=args.limit)
+    else:
+        questions = list(SYNTHETIC)[: args.limit]
     if not questions:
         print("no questions loaded")
         return 2
@@ -138,7 +139,11 @@ def cmd_guard(args: argparse.Namespace) -> int:
     except BackendError as exc:
         print(f"guard unavailable: {exc}")
         return 2
-    questions = list(SYNTHETIC)[: args.limit]
+    questions = (
+        load_mmlu_hf(args.mmlu_subject, limit=args.limit)
+        if args.mmlu_subject
+        else list(SYNTHETIC)[: args.limit]
+    )
     specs = [spec_for(q) for q in questions]
     calls = len(specs) * args.rounds + 4
     print(f"about to make {calls} calls to {guard.name}")
@@ -161,7 +166,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.set_defaults(func=cmd_reanalyze)
 
     x = sub.add_parser("run", help="run the attack against a model")
-    x.add_argument("--mmlu", help="path to an MMLU subject CSV; omit to use the synthetic set")
+    x.add_argument("--mmlu", help="path to a local MMLU subject CSV")
+    x.add_argument("--mmlu-subject", help="fetch a real MMLU subject, e.g. high_school_chemistry")
     x.add_argument("--limit", type=int, default=4, help="questions to use")
     x.add_argument("--probes", type=int, default=10, help="victim probes per pair, 10 matches the paper")
     x.add_argument("--rounds", type=int, default=5, help="attack queries per pair")
@@ -175,6 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--guard", default="groq:meta-llama/llama-prompt-guard-2-86m",
                    help="detector backend")
     g.add_argument("--limit", type=int, default=4, help="victim-target pairs to score")
+    g.add_argument("--mmlu-subject", help="score queries built from a real MMLU subject")
     g.add_argument("--rounds", type=int, default=5, help="attack rounds per pair")
     g.add_argument("--yes", action="store_true", help="confirm after seeing the call estimate")
     g.set_defaults(func=cmd_guard)

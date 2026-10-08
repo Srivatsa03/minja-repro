@@ -12,6 +12,9 @@ and must never appear in a number attributed to MMLU.
 from __future__ import annotations
 
 import csv
+import json
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -73,6 +76,56 @@ def load_mmlu_csv(path: Path, *, limit: int | None = None) -> list[Question]:
             )
             if limit is not None and len(out) >= limit:
                 break
+    return out
+
+
+HF_ROWS = "https://datasets-server.huggingface.co/rows"
+CACHE = Path(__file__).resolve().parent.parent / "data" / "mmlu"
+
+
+def load_mmlu_hf(subject: str = "high_school_chemistry", *, split: str = "test",
+                 limit: int = 20, cache: bool = True) -> list[Question]:
+    """Fetch a real MMLU subject through the public datasets REST API.
+
+    Uses the REST endpoint rather than the ``datasets`` library so the package
+    keeps zero dependencies, which also matters on a memory-constrained machine
+    where loading an Arrow-backed dataset is the heaviest thing in the run.
+
+    Rows are cached under ``data/mmlu`` so a rerun is offline and the exact
+    questions behind a published number stay recoverable.
+    """
+    cached = CACHE / f"{subject}-{split}-{limit}.json"
+    if cache and cached.exists():
+        rows = json.loads(cached.read_text())
+    else:
+        query = urllib.parse.urlencode(
+            {"dataset": "cais/mmlu", "config": subject, "split": split,
+             "offset": 0, "length": min(limit, 100)}
+        )
+        request = urllib.request.Request(
+            f"{HF_ROWS}?{query}", headers={"user-agent": "minja-repro/0.1"}
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read())
+        rows = [r["row"] for r in payload.get("rows", [])]
+        if cache:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_text(json.dumps(rows, indent=1))
+
+    out: list[Question] = []
+    for row in rows[:limit]:
+        choices = tuple(str(c) for c in (row.get("choices") or []))
+        answer = row.get("answer")
+        if len(choices) < 2 or not isinstance(answer, int) or not 0 <= answer < len(choices):
+            continue
+        out.append(
+            Question(
+                question=str(row.get("question", "")).strip(),
+                options=choices,
+                answer_index=answer,
+                source=f"mmlu:{subject}",
+            )
+        )
     return out
 
 
