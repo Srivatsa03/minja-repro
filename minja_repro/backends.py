@@ -23,6 +23,11 @@ from .models import CallableModel
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
+
+#: Some providers sit behind a WAF that rejects urllib's default agent outright.
+#: Groq returns Cloudflare error 1010 to "Python-urllib/3.x" while accepting the
+#: identical request from curl, so a real agent string is required, not cosmetic.
+USER_AGENT = "minja-repro/0.1 (+https://github.com/Srivatsa03/minja-repro)"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 
 #: OpenAI-compatible providers, by backend name. The chat-completions shape is identical
@@ -30,6 +35,9 @@ DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 OPENAI_COMPATIBLE: dict[str, tuple[str, str, str]] = {
     # name: (base url, env var holding the key, default model)
     "xai": ("https://api.x.ai/v1", "XAI_API_KEY", "grok-4"),
+    # Groq is the inference provider at groq.com, not xAI's Grok model. Keys begin
+    # "gsk_" where xAI's begin "xai-", and the two are easy to confuse by name.
+    "groq": ("https://api.groq.com/openai/v1", "XAI_API_KEY", "openai/gpt-oss-120b"),
     "openai": ("https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-4.1"),
     "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openai/gpt-4.1"),
 }
@@ -48,7 +56,11 @@ def _post(url: str, payload: dict, headers: dict, *, timeout: float, retries: in
     body = json.dumps(payload).encode()
     last: Exception | None = None
     for attempt in range(retries + 1):
-        request = urllib.request.Request(url, data=body, headers={**headers, "content-type": "application/json"})
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={**headers, "content-type": "application/json", "user-agent": USER_AGENT},
+        )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read())
@@ -144,10 +156,11 @@ def openai_compatible_backend(
     provider: str,
     model: str | None = None,
     *,
-    max_tokens: int = 512,
+    max_tokens: int = 2048,
     temperature: float = 0.0,
     timeout: float = 90.0,
     retries: int = 3,
+    reasoning_effort: str | None = "low",
 ) -> CallableModel:
     """Any provider speaking the OpenAI chat-completions shape, including xAI.
 
@@ -168,22 +181,42 @@ def openai_compatible_backend(
     chosen = model or default_model
 
     def call(prompt: str) -> str:
+        payload: dict[str, object] = {
+            "model": chosen,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        # A reasoning model spends the completion budget thinking before it emits
+        # anything, so a budget sized for the visible answer alone returns empty
+        # content with finish_reason "length". Capping the effort keeps the
+        # answer in budget; gpt-oss-120b used 115 completion tokens at low effort
+        # against 202 at default on the same prompt.
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+
         data = _post(
             f"{base}/chat/completions",
-            {
-                "model": chosen,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "messages": [{"role": "user", "content": prompt}],
-            },
+            payload,
             {"authorization": f"Bearer {key}"},
             timeout=timeout,
             retries=retries,
         )
         choices = data.get("choices") or []
-        text = (choices[0].get("message", {}).get("content") or "") if choices else ""
+        if not choices:
+            raise BackendError(f"no choices in response: {json.dumps(data)[:300]}")
+        choice = choices[0]
+        message = choice.get("message") or {}
+        text = message.get("content") or ""
         if not text:
-            raise BackendError(f"no text in response: {json.dumps(data)[:300]}")
+            # Say why, rather than printing a truncated blob. Empty content on a
+            # reasoning model almost always means the budget went on reasoning.
+            raise BackendError(
+                f"empty content from {chosen}: finish_reason={choice.get('finish_reason')!r}, "
+                f"reasoning chars={len(message.get('reasoning') or '')}, "
+                f"completion_tokens={(data.get('usage') or {}).get('completion_tokens')}. "
+                "Raise max_tokens or lower reasoning_effort."
+            )
         return text
 
     return CallableModel(call, f"{provider}:{chosen}")
@@ -196,7 +229,8 @@ def list_models(provider: str) -> list[str]:
     if not key:
         raise BackendError(f"{env_var} is not set")
     request = urllib.request.Request(
-        f"{base}/models", headers={"authorization": f"Bearer {key}"}
+        f"{base}/models",
+        headers={"authorization": f"Bearer {key}", "user-agent": USER_AGENT},
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:

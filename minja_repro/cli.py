@@ -9,6 +9,7 @@ from pathlib import Path
 from . import __version__
 from .backends import OPENAI_COMPATIBLE, BackendError, list_models, resolve
 from .dataset import SYNTHETIC, load_mmlu_csv, spec_for, victim_queries
+from .guard import format_guard_test, run_guard_test
 from .evaluate import (
     Experiment,
     format_experiment,
@@ -130,6 +131,26 @@ def cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_guard(args: argparse.Namespace) -> int:
+    """Test the paper's claim that MINJA bypasses detection-based moderation."""
+    try:
+        guard = resolve(args.guard)
+    except BackendError as exc:
+        print(f"guard unavailable: {exc}")
+        return 2
+    questions = list(SYNTHETIC)[: args.limit]
+    specs = [spec_for(q) for q in questions]
+    calls = len(specs) * args.rounds + 4
+    print(f"about to make {calls} calls to {guard.name}")
+    if not args.yes:
+        print("re-run with --yes to proceed; nothing has been sent")
+        return 0
+    scores = run_guard_test(guard, specs, rounds=args.rounds)
+    print()
+    print(format_guard_test(scores, guard.name))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="minja-repro", description="Reproduction of MINJA, arXiv:2503.03704.")
     p.add_argument("--version", action="version", version=f"minja-repro {__version__}")
@@ -149,6 +170,14 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--yes", action="store_true",
                    help="confirm a real-backend run after seeing the call estimate")
     x.set_defaults(func=cmd_run)
+
+    g = sub.add_parser("guard", help="score MINJA's own queries with an injection detector")
+    g.add_argument("--guard", default="groq:meta-llama/llama-prompt-guard-2-86m",
+                   help="detector backend")
+    g.add_argument("--limit", type=int, default=4, help="victim-target pairs to score")
+    g.add_argument("--rounds", type=int, default=5, help="attack rounds per pair")
+    g.add_argument("--yes", action="store_true", help="confirm after seeing the call estimate")
+    g.set_defaults(func=cmd_guard)
 
     m = sub.add_parser("models", help="list the models a provider serves")
     m.add_argument("provider", choices=sorted(OPENAI_COMPATIBLE), help="provider to query")
