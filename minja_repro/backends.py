@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -180,10 +181,13 @@ def openai_compatible_backend(
         raise BackendError(f"{env_var} is not set; export it and re-run")
     chosen = model or default_model
 
+    unsupported: set[str] = set()
+    token_cap: list[int | None] = [None]
+
     def call(prompt: str) -> str:
         payload: dict[str, object] = {
             "model": chosen,
-            "max_tokens": max_tokens,
+            "max_tokens": token_cap[0] or max_tokens,
             "temperature": temperature,
             "messages": [{"role": "user", "content": prompt}],
         }
@@ -192,16 +196,35 @@ def openai_compatible_backend(
         # content with finish_reason "length". Capping the effort keeps the
         # answer in budget; gpt-oss-120b used 115 completion tokens at low effort
         # against 202 at default on the same prompt.
-        if reasoning_effort:
+        if reasoning_effort and "reasoning_effort" not in unsupported:
             payload["reasoning_effort"] = reasoning_effort
 
-        data = _post(
-            f"{base}/chat/completions",
-            payload,
-            {"authorization": f"Bearer {key}"},
-            timeout=timeout,
-            retries=retries,
-        )
+        headers = {"authorization": f"Bearer {key}"}
+        # Parameters that are valid for one model on an OpenAI-compatible endpoint
+        # are rejected by another: a classifier refuses reasoning_effort, and a
+        # small one caps max_tokens well below a chat model's. Rather than make the
+        # caller carry a table of per-model quirks, adapt once from the error and
+        # remember, so the rest of the run is one request per prompt.
+        for _ in range(3):
+            try:
+                data = _post(f"{base}/chat/completions", payload, headers,
+                             timeout=timeout, retries=retries)
+                break
+            except BackendError as exc:
+                message = str(exc)
+                if "reasoning_effort" in message and "reasoning_effort" in payload:
+                    payload.pop("reasoning_effort", None)
+                    unsupported.add("reasoning_effort")
+                    continue
+                cap = re.search(r"max_tokens` must be less than or equal to `(\d+)", message)
+                if cap:
+                    limit = int(cap.group(1))
+                    payload["max_tokens"] = limit
+                    token_cap[0] = limit
+                    continue
+                raise
+        else:
+            raise BackendError(f"could not satisfy {chosen} after adapting parameters")
         choices = data.get("choices") or []
         if not choices:
             raise BackendError(f"no choices in response: {json.dumps(data)[:300]}")
