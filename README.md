@@ -86,6 +86,25 @@ minja-repro run --limit 4 --probes 10 --rounds 5
 minja-repro run --mmlu data/mmlu/high_school_chemistry_test.csv --limit 20
 ```
 
+Real backends, zero dependencies, via `urllib`:
+
+```bash
+export ANTHROPIC_API_KEY=...          # from console.anthropic.com, not a Claude seat
+minja-repro run --backend anthropic:claude-haiku-4-5-20251001 --limit 10 --yes
+minja-repro run --backend ollama:llama3.2:3b --limit 10 --yes
+```
+
+A real-backend run prints the call estimate and does nothing without `--yes`.
+
+**A Claude Pro, Max or Teams subscription does not include API access.** Those are seats on
+claude.ai and the desktop and CLI apps. Programmatic use needs a console key, billed
+separately. Driving a subscription CLI in a loop to avoid that is not what a seat is for, so
+it is deliberately not implemented.
+
+The whole MMLU row is cheap: about 250 calls for 10 victim-target pairs, roughly 225k input
+and 22k output tokens, which is **$0.34 on Haiku 4.5 or $1.01 on Sonnet 5** at list price.
+Cost is not the reason this has not been run.
+
 MMLU is not vendored. Download it yourself; the loader reads the standard subject CSV layout.
 The built-in question set is labelled synthetic and must not appear in a number attributed to
 MMLU.

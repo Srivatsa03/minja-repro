@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
+from .backends import BackendError, resolve
 from .dataset import SYNTHETIC, load_mmlu_csv, spec_for, victim_queries
 from .evaluate import (
     Experiment,
@@ -61,11 +63,28 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("no questions loaded")
         return 2
 
-    model = MockModel()
-    for q in questions:
-        model.ground_truth(q.question, q.correct)
-        for probe in victim_queries(q, args.probes):
-            model.ground_truth(probe, q.correct)
+    mock = args.backend == "mock"
+    if mock:
+        model = MockModel()
+        for q in questions:
+            model.ground_truth(q.question, q.correct)
+            for probe in victim_queries(q, args.probes):
+                model.ground_truth(probe, q.correct)
+    else:
+        try:
+            model = resolve(args.backend)
+        except BackendError as exc:
+            print(f"backend unavailable: {exc}")
+            return 2
+
+    per_pair = args.probes * 2 + args.rounds
+    calls = per_pair * len(questions)
+    if not mock:
+        print(f"about to make ~{calls} calls to {model.name} "
+              f"({len(questions)} pairs x {per_pair} per pair)")
+        if not args.yes:
+            print("re-run with --yes to proceed; nothing has been sent")
+            return 0
 
     retriever = LexicalRetriever()
     exp = Experiment(model_name=model.name, retriever_name=retriever.name, rounds=args.rounds)
@@ -81,10 +100,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
 
     print(format_experiment(exp))
-    print()
-    print("The model above is a deterministic mock. It follows instructions and")
-    print("demonstrations by construction, so this run shows the harness is wired")
-    print("correctly and says nothing about whether a real model is vulnerable.")
+    print(f"\nrun date  {datetime.now(timezone.utc).date().isoformat()}")
+    if mock:
+        print("\nThe model above is a deterministic mock. It follows instructions and")
+        print("demonstrations by construction, so this run shows the harness is wired")
+        print("correctly and says nothing about whether a real model is vulnerable.")
+    else:
+        print("\nA hosted model is not a fixed artifact, so quote the model name and the")
+        print("run date with any rate from this run. The retriever is lexical, not the")
+        print("embedding similarity the paper used.")
+        if args.backend.startswith("ollama"):
+            print("A small local model is a weaker substitution than the paper's GPT-4-class")
+            print("backbones. This answers whether the attack transfers to it, nothing wider.")
     if questions[0].source.startswith("synthetic"):
         print("The questions are synthetic, not MMLU.")
     return 0
@@ -104,6 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--limit", type=int, default=4, help="questions to use")
     x.add_argument("--probes", type=int, default=10, help="victim probes per pair, 10 matches the paper")
     x.add_argument("--rounds", type=int, default=5, help="attack queries per pair")
+    x.add_argument("--backend", default="mock",
+                   help="mock, anthropic:<model>, or ollama:<model>")
+    x.add_argument("--yes", action="store_true",
+                   help="confirm a real-backend run after seeing the call estimate")
     x.set_defaults(func=cmd_run)
     return p
 
