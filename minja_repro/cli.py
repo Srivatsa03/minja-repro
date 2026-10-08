@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
-from .backends import BackendError, resolve
+from .backends import OPENAI_COMPATIBLE, BackendError, list_models, resolve
 from .dataset import SYNTHETIC, load_mmlu_csv, spec_for, victim_queries
 from .evaluate import (
     Experiment,
@@ -117,6 +117,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_models(args: argparse.Namespace) -> int:
+    """Ask the provider what it serves, so the run names a model that exists."""
+    try:
+        names = list_models(args.provider)
+    except BackendError as exc:
+        print(f"could not list models: {exc}")
+        return 2
+    print(f"{args.provider} serves {len(names)} models:")
+    for name in names:
+        print(f"  {name}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="minja-repro", description="Reproduction of MINJA, arXiv:2503.03704.")
     p.add_argument("--version", action="version", version=f"minja-repro {__version__}")
@@ -136,6 +149,10 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--yes", action="store_true",
                    help="confirm a real-backend run after seeing the call estimate")
     x.set_defaults(func=cmd_run)
+
+    m = sub.add_parser("models", help="list the models a provider serves")
+    m.add_argument("provider", choices=sorted(OPENAI_COMPATIBLE), help="provider to query")
+    m.set_defaults(func=cmd_models)
     return p
 
 

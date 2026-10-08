@@ -25,6 +25,15 @@ ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 
+#: OpenAI-compatible providers, by backend name. The chat-completions shape is identical
+#: across these, so one implementation covers them and anything else that speaks it.
+OPENAI_COMPATIBLE: dict[str, tuple[str, str, str]] = {
+    # name: (base url, env var holding the key, default model)
+    "xai": ("https://api.x.ai/v1", "XAI_API_KEY", "grok-4"),
+    "openai": ("https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-4.1"),
+    "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openai/gpt-4.1"),
+}
+
 
 class BackendError(RuntimeError):
     pass
@@ -131,6 +140,72 @@ def ollama_backend(
     return CallableModel(call, f"ollama:{model}")
 
 
+def openai_compatible_backend(
+    provider: str,
+    model: str | None = None,
+    *,
+    max_tokens: int = 512,
+    temperature: float = 0.0,
+    timeout: float = 90.0,
+    retries: int = 3,
+) -> CallableModel:
+    """Any provider speaking the OpenAI chat-completions shape, including xAI.
+
+    One implementation rather than one per vendor, because the request and
+    response bodies are the same and the only differences are the base URL, the
+    environment variable, and the default model.
+    """
+    try:
+        base, env_var, default_model = OPENAI_COMPATIBLE[provider]
+    except KeyError:
+        raise BackendError(
+            f"unknown provider {provider!r}; known: {', '.join(sorted(OPENAI_COMPATIBLE))}"
+        ) from None
+
+    key = os.environ.get(env_var)
+    if not key:
+        raise BackendError(f"{env_var} is not set; export it and re-run")
+    chosen = model or default_model
+
+    def call(prompt: str) -> str:
+        data = _post(
+            f"{base}/chat/completions",
+            {
+                "model": chosen,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            {"authorization": f"Bearer {key}"},
+            timeout=timeout,
+            retries=retries,
+        )
+        choices = data.get("choices") or []
+        text = (choices[0].get("message", {}).get("content") or "") if choices else ""
+        if not text:
+            raise BackendError(f"no text in response: {json.dumps(data)[:300]}")
+        return text
+
+    return CallableModel(call, f"{provider}:{chosen}")
+
+
+def list_models(provider: str) -> list[str]:
+    """Ask the provider what it serves, so a model name is checked not guessed."""
+    base, env_var, _ = OPENAI_COMPATIBLE[provider]
+    key = os.environ.get(env_var)
+    if not key:
+        raise BackendError(f"{env_var} is not set")
+    request = urllib.request.Request(
+        f"{base}/models", headers={"authorization": f"Bearer {key}"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        raise BackendError(f"HTTP {exc.code}: {exc.read()[:200].decode(errors='replace')}") from exc
+    return sorted(m.get("id", "") for m in (payload.get("data") or []))
+
+
 def resolve(spec: str) -> CallableModel:
     """Build a backend from a ``kind:model`` string, e.g. ``anthropic:claude-sonnet-5``."""
     kind, _, name = spec.partition(":")
@@ -138,4 +213,7 @@ def resolve(spec: str) -> CallableModel:
         return anthropic_backend(name or "claude-haiku-4-5-20251001")
     if kind == "ollama":
         return ollama_backend(name or "llama3.2:3b")
-    raise BackendError(f"unknown backend {kind!r}; use anthropic:<model> or ollama:<model>")
+    if kind in OPENAI_COMPATIBLE:
+        return openai_compatible_backend(kind, name or None)
+    known = ", ".join(["anthropic", "ollama", *sorted(OPENAI_COMPATIBLE)])
+    raise BackendError(f"unknown backend {kind!r}; use one of: {known}")
