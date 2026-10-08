@@ -1,0 +1,117 @@
+"""Command line interface."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from . import __version__
+from .dataset import SYNTHETIC, load_mmlu_csv, spec_for, victim_queries
+from .evaluate import (
+    Experiment,
+    format_experiment,
+    interval_for_published_rate,
+    pooled_interval_for_published_rate,
+    run_pair,
+)
+from .models import MockModel
+from .retriever import LexicalRetriever
+
+#: Table 1 of arXiv:2503.03704. Attack queries per victim-target pair: 10 on MMLU, 15 elsewhere.
+PUBLISHED = (
+    ("EHRAgent MIMIC-III", "GPT-4", 95.6, 57.0, 15),
+    ("EHRAgent eICU", "GPT-4", 98.5, 90.0, 15),
+    ("RAP Webshop", "GPT-4", 96.3, 77.4, 15),
+    ("RAP Webshop", "GPT-4o", 99.3, 98.9, 15),
+    ("QA agent MMLU", "GPT-4 / GPT-4o", 100.0, 68.9, 10),
+)
+
+
+def cmd_reanalyze(args: argparse.Namespace) -> int:
+    print("Re-analysis of the published rates in arXiv:2503.03704, Table 1.")
+    print("No rerun. Each reported percentage is converted back to a success count and")
+    print("the Wilson interval that count supports is shown.\n")
+    print(f"{'row':22} {'backbone':16} {'n':>3}  {'ISR 95% CI':>20}  {'ASR 95% CI':>20}")
+    for row, backbone, isr, asr, n in PUBLISHED:
+        _, ilo, ihi = interval_for_published_rate(isr, n)
+        _, alo, ahi = interval_for_published_rate(asr, n)
+        print(
+            f"{row:22} {backbone:16} {n:>3}  "
+            f"{isr:5.1f} [{ilo * 100:4.1f},{ihi * 100:5.1f}]  "
+            f"{asr:5.1f} [{alo * 100:4.1f},{ahi * 100:5.1f}]"
+        )
+    print("\nThose are per-pair intervals: what one victim-target pair's rate rests on.")
+    if args.pairs:
+        print(f"\nPooled over {args.pairs} pairs, if that is the pair count:")
+        for row, backbone, isr, asr, n in PUBLISHED:
+            _, alo, ahi = pooled_interval_for_published_rate(asr, n, args.pairs)
+            print(f"  {row:22} ASR {asr:5.1f} -> [{alo * 100:4.1f},{ahi * 100:5.1f}]  (n={n * args.pairs})")
+    print("\nThe reported +/- in the paper is a standard deviation between pairs, which is")
+    print("neither of these. A pooled claim needs the pair count read from the paper.")
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    questions = (
+        load_mmlu_csv(Path(args.mmlu), limit=args.limit)
+        if args.mmlu
+        else list(SYNTHETIC)[: args.limit]
+    )
+    if not questions:
+        print("no questions loaded")
+        return 2
+
+    model = MockModel()
+    for q in questions:
+        model.ground_truth(q.question, q.correct)
+        for probe in victim_queries(q, args.probes):
+            model.ground_truth(probe, q.correct)
+
+    retriever = LexicalRetriever()
+    exp = Experiment(model_name=model.name, retriever_name=retriever.name, rounds=args.rounds)
+    for q in questions:
+        exp.outcomes.append(
+            run_pair(
+                model,
+                spec_for(q),
+                victim_queries(q, args.probes),
+                rounds=args.rounds,
+                retriever=retriever,
+            )
+        )
+
+    print(format_experiment(exp))
+    print()
+    print("The model above is a deterministic mock. It follows instructions and")
+    print("demonstrations by construction, so this run shows the harness is wired")
+    print("correctly and says nothing about whether a real model is vulnerable.")
+    if questions[0].source.startswith("synthetic"):
+        print("The questions are synthetic, not MMLU.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="minja-repro", description="Reproduction of MINJA, arXiv:2503.03704.")
+    p.add_argument("--version", action="version", version=f"minja-repro {__version__}")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    r = sub.add_parser("reanalyze", help="intervals implied by the paper's published rates")
+    r.add_argument("--pairs", type=int, default=0, help="pair count, to also show pooled intervals")
+    r.set_defaults(func=cmd_reanalyze)
+
+    x = sub.add_parser("run", help="run the attack against a model")
+    x.add_argument("--mmlu", help="path to an MMLU subject CSV; omit to use the synthetic set")
+    x.add_argument("--limit", type=int, default=4, help="questions to use")
+    x.add_argument("--probes", type=int, default=10, help="victim probes per pair, 10 matches the paper")
+    x.add_argument("--rounds", type=int, default=5, help="attack queries per pair")
+    x.set_defaults(func=cmd_run)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
