@@ -6,3 +6,4 @@ dist/
 .pytest_cache/
 out/
 data/mmlu/
+PROJECT-BRIEF.md
