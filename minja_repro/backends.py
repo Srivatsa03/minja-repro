@@ -103,7 +103,10 @@ def _post(url: str, payload: dict, headers: dict, *, timeout: float, retries: in
             if exc.code not in (500, 502, 503, 504) or attempt >= retries:
                 raise BackendError(f"HTTP {exc.code}: {detail}") from exc
             last = exc
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # OSError covers ConnectionResetError and other raw socket drops, which
+            # a long paced run on a free tier hits eventually. urllib wraps some but
+            # not all of these in URLError, so catch the base class too and retry.
             if attempt >= retries:
                 raise BackendError(f"transport failure: {exc}") from exc
             last = exc
